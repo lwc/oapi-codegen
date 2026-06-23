@@ -122,6 +122,7 @@ func genResponseUnmarshal(op *OperationDefinition) string {
 	// Add a case for each possible response:
 	buffer := new(bytes.Buffer)
 	responses := op.Spec.Responses
+	handledResponseNames := make(map[string]struct{})
 	for _, typeDefinition := range typeDefinitions {
 
 		responseRef := responses.Value(typeDefinition.ResponseName)
@@ -134,6 +135,8 @@ func genResponseUnmarshal(op *OperationDefinition) string {
 			fmt.Fprintf(os.Stderr, "Response %s.%s has nil value\n", op.OperationId, typeDefinition.ResponseName)
 			continue
 		}
+
+		handledResponseNames[typeDefinition.ResponseName] = struct{}{}
 
 		// If there is no content-type then we have no unmarshaling to do:
 		if len(responseRef.Value.Content) == 0 {
@@ -216,6 +219,52 @@ func genResponseUnmarshal(op *OperationDefinition) string {
 				caseAction := fmt.Sprintf("// Content-type (%s) unsupported", contentTypeName)
 				caseClauseKey := "case " + getConditionOfResponseName("rsp.StatusCode", typeDefinition.ResponseName) + ":"
 				unhandledCaseClauses[prefixLeastSpecific+caseClauseKey] = fmt.Sprintf("%s\n%s\n", caseClauseKey, caseAction)
+			}
+		}
+	}
+
+	// Emit explicit case clauses for responses declared without content (e.g.
+	// "204 No Content"). These responses have no type definitions, so the loop
+	// above never visits them. Without an explicit case clause, the "default"
+	// catch-all (which matches with "&& true") would attempt to unmarshal an
+	// empty body and fail.
+	//
+	// Sort key selection ensures correct precedence:
+	//   - Exact status codes (e.g. "204") use prefix "0" so they appear before
+	//     the content-handling cases. This is safe because an exact code can
+	//     only match its own status and cannot shadow other responses.
+	//   - Range wildcards (e.g. "2XX") use prefixLeastSpecific ("9") so they
+	//     sort alongside (and after) explicit content-handling cases for codes
+	//     within the range, preventing a bodyless range from shadowing a
+	//     response like "200" that does have content.
+	//   - "default" is skipped — a bodyless default would emit "case true:"
+	//     which shadows everything. Such a spec is degenerate and the existing
+	//     behaviour (no guard) is acceptable.
+	if responses != nil {
+		for _, responseName := range SortedMapKeys(responses.Map()) {
+			if _, handled := handledResponseNames[responseName]; handled {
+				continue
+			}
+			if responseName == "default" {
+				continue
+			}
+			responseRef := responses.Value(responseName)
+			if responseRef == nil || responseRef.Value == nil {
+				continue
+			}
+			if len(responseRef.Value.Content) == 0 {
+				caseCondition := getConditionOfResponseName("rsp.StatusCode", responseName)
+				caseClause := fmt.Sprintf("case %s:\nbreak // No content-type\n", caseCondition)
+
+				// Exact codes sort first (can't shadow); ranges sort last
+				// (must not shadow explicit content cases within the range).
+				prefix := "0"
+				switch responseName {
+				case "1XX", "2XX", "3XX", "4XX", "5XX":
+					prefix = prefixLeastSpecific
+				}
+				caseKey := fmt.Sprintf("%s.nocontent.%s", prefix, responseName)
+				handledCaseClauses[caseKey] = caseClause
 			}
 		}
 	}
